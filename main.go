@@ -438,10 +438,10 @@ Exit code: 0 if all entries are valid, 1 if any warnings or errors are found.`,
 
 	providerCmd.AddCommand(providerListCmd)
 
-	providerInitCmd := &cobra.Command{
-		Use:     "init",
+	initConfigCmd := &cobra.Command{
+		Use:     "init-config",
 		Short:   "Initialize client provider configuration",
-		Example: `  opkssh provider init`,
+		Example: `  opkssh client init-config`,
 		Args:    cobra.ExactArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			err := config.CreateDefaultClientConfig(configPathArg, afero.NewOsFs())
@@ -453,9 +453,9 @@ Exit code: 0 if all entries are valid, 1 if any warnings or errors are found.`,
 		},
 	}
 
-	providerInitCmd.Flags().StringVar(&configPathArg, "config-path", "", "Path to the client config file. Default: ~/.opk/config.yml on linux and %APPDATA%\\.opk\\config.yml on windows.")
+	initConfigCmd.Flags().StringVar(&configPathArg, "config-path", "", "Path to the client config file. Default: ~/.opk/config.yml on linux and %APPDATA%\\.opk\\config.yml on windows.")
 
-	providerCmd.AddCommand(providerInitCmd)
+	clientCmd.AddCommand(initConfigCmd)
 
 	clientCmd.AddCommand(providerCmd)
 
