@@ -94,7 +94,7 @@ func GetClientConfigFromFile(configPath string, Fs afero.Fs) (*ClientConfig, err
 func CreateDefaultClientConfig(configPath string, Fs afero.Fs) error {
 	if configPath == "" {
 		var err error
-		configPath, err = GetDefaultClientConfigPath(configPath)
+		configPath, err = GetDefaultClientConfigPath()
 
 		if err != nil {
 			return err
