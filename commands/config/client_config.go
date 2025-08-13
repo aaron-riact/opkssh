@@ -109,7 +109,7 @@ func CreateDefaultClientConfig(configPath string, Fs afero.Fs) error {
 
 	afs := &afero.Afero{Fs: Fs}
 
-	if err := afs.Fs.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+	if err := afs.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
