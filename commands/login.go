@@ -85,10 +85,12 @@ type LoginCmd struct {
 	ProviderArg           string // OpenID Provider specification in the format: <issuer>,<client_id> or <issuer>,<client_id>,<client_secret> or <issuer>,<client_id>,<client_secret>,<scopes>
 	ProviderAliasArg      string
 	KeyTypeArg            KeyType
+	PrintKeyArg           bool // Print private key and SSH cert instead of writing them to the filesystem
 	SSHConfigured         bool
-	Verbosity             int                       // Default verbosity is 0, 1 is verbose, 2 is debug
-	overrideProvider      *providers.OpenIdProvider // Used in tests to override the provider to inject a mock provider
+	Verbosity             int // Default verbosity is 0, 1 is verbose, 2 is debug
+	RemoteRedirectURI     string
 
+	overrideProvider *providers.OpenIdProvider // Used in tests to override the provider to inject a mock provider
 	// State
 	Config *config.ClientConfig
 
@@ -98,12 +100,16 @@ type LoginCmd struct {
 	alg        jwa.SignatureAlgorithm
 	client     *client.OpkClient
 	principals []string
+
+	// For testing
+	OutWriter io.Writer // Captures non-logged output that would normally be written to stdout
 }
 
 // NewLogin creates a new LoginCmd instance with the provided arguments.
 func NewLogin(autoRefreshArg bool, configPathArg string, createConfigArg bool, configureArg bool, logDirArg string,
 	sendAccessTokenArg bool, disableBrowserOpenArg bool, printIdTokenArg bool,
-	providerArg string, keyPathArg string, providerAliasArg string, keyTypeArg KeyType,
+	providerArg string, printKeyArg bool, keyPathArg string, providerAliasArg string, keyTypeArg KeyType,
+	remoteRedirectUri string,
 ) *LoginCmd {
 	return &LoginCmd{
 		Fs:                    afero.NewOsFs(),
@@ -117,8 +123,10 @@ func NewLogin(autoRefreshArg bool, configPathArg string, createConfigArg bool, c
 		PrintIdTokenArg:       printIdTokenArg,
 		KeyPathArg:            keyPathArg,
 		ProviderArg:           providerArg,
+		PrintKeyArg:           printKeyArg,
 		ProviderAliasArg:      providerAliasArg,
 		KeyTypeArg:            keyTypeArg,
+		RemoteRedirectURI:     remoteRedirectUri,
 	}
 }
 
@@ -143,40 +151,22 @@ func (l *LoginCmd) Run(ctx context.Context) error {
 
 	// If the Config has been set in the struct don't replace it. This is useful for testing
 	if l.Config == nil {
-		if l.ConfigPathArg == "" {
-			dir, dirErr := os.UserHomeDir()
-			if dirErr != nil {
-				return fmt.Errorf("failed to get user config dir: %w", dirErr)
-			}
-			l.ConfigPathArg = filepath.Join(dir, ".opk", "config.yml")
+		if err := config.ResolveClientConfigPath(&l.ConfigPathArg); err != nil {
+			return err
 		}
-		var configBytes []byte
 		if _, err := l.Fs.Stat(l.ConfigPathArg); err == nil {
 			if l.CreateConfigArg {
 				log.Printf("--create-config=true but config file already exists at %s", l.ConfigPathArg)
 			}
 
-			// Load the file from the filesystem
-			afs := &afero.Afero{Fs: l.Fs}
-			configBytes, err = afs.ReadFile(l.ConfigPathArg)
-			if err != nil {
-				return fmt.Errorf("failed to read config file: %w", err)
-			}
-			l.Config, err = config.NewClientConfig(configBytes)
-			if err != nil {
-				return fmt.Errorf("failed to parse config file: %w", err)
+			if client_config, err := config.GetClientConfigFromFile((l.ConfigPathArg), l.Fs); err != nil {
+				return err
+			} else {
+				l.Config = client_config
 			}
 		} else {
 			if l.CreateConfigArg {
-				afs := &afero.Afero{Fs: l.Fs}
-				if err := l.Fs.MkdirAll(filepath.Dir(l.ConfigPathArg), 0o755); err != nil {
-					return fmt.Errorf("failed to create config directory: %w", err)
-				}
-				if err := afs.WriteFile(l.ConfigPathArg, config.DefaultClientConfig, 0o644); err != nil {
-					return fmt.Errorf("failed to write default config file: %w", err)
-				}
-				log.Printf("created client config file at %s", l.ConfigPathArg)
-				return nil
+				return config.CreateDefaultClientConfig(l.ConfigPathArg, l.Fs)
 			} else {
 				log.Printf("failed to find client config file to generate a default config, run `opkssh login --create-config` to create a default config file")
 			}
@@ -403,6 +393,11 @@ func (l *LoginCmd) determineProvider() (providers.OpenIdProvider, *choosers.WebC
 		if !ok {
 			return nil, nil, fmt.Errorf("error getting provider config for alias %s", defaultProviderAlias)
 		}
+		if l.RemoteRedirectURI != "" {
+			// Override the remote redirect URI
+			providerConfig.RemoteRedirectURI = l.RemoteRedirectURI
+		}
+
 		provider, err = providerConfig.ToProvider(openBrowser)
 		if err != nil {
 			return nil, nil, fmt.Errorf("error creating provider from config: %w", err)
@@ -412,6 +407,10 @@ func (l *LoginCmd) determineProvider() (providers.OpenIdProvider, *choosers.WebC
 		// If the default provider is WEBCHOOSER, we need to create a chooser and return it
 		var providerList []providers.BrowserOpenIdProvider
 		for _, providerConfig := range providerConfigs {
+			if l.RemoteRedirectURI != "" {
+				// Override the remote redirect URI
+				providerConfig.RemoteRedirectURI = l.RemoteRedirectURI
+			}
 			op, err := providerConfig.ToProvider(openBrowser)
 			if err != nil {
 				return nil, nil, fmt.Errorf("error creating provider from config: %w", err)
@@ -473,7 +472,11 @@ func (l *LoginCmd) login(ctx context.Context, provider providers.OpenIdProvider,
 	}
 
 	// Write ssh secret key and public key to filesystem
-	if seckeyPath != "" {
+	if l.PrintKeyArg {
+		w := l.out()
+		fmt.Fprintln(w, string(certBytes))    // Base64 encoded SSH cert
+		fmt.Fprintln(w, string(seckeySshPem)) // SSH private key in OpenSSH native format
+	} else if seckeyPath != "" {
 		// If we have set seckeyPath then write it there
 		if err := l.writeKeys(seckeyPath, seckeyPath+"-cert.pub", seckeySshPem, certBytes); err != nil {
 			return nil, fmt.Errorf("failed to write SSH keys to filesystem: %w", err)
@@ -596,6 +599,13 @@ func (l *LoginCmd) LoginWithRefresh(ctx context.Context, provider providers.Refr
 			}
 		}
 	}
+}
+
+func (l *LoginCmd) out() io.Writer {
+	if l.OutWriter != nil {
+		return l.OutWriter
+	}
+	return os.Stdout
 }
 
 func createSSHCert(pkt *pktoken.PKToken, signer crypto.Signer, principals []string) ([]byte, []byte, error) {
@@ -831,9 +841,13 @@ func IdentityString(pkt pktoken.PKToken) (string, error) {
 	}
 	claims := idt.GetClaims()
 	if claims.Email == "" {
-		return "Sub, issuer, audience: \n" + claims.Subject + " " + claims.Issuer + " " + claims.Audience, nil
+		return fmt.Sprintf(`WARNING: Email claim is missing from ID token. Policies based on email will not work.
+Check if your client config (~/.opk/config.yml) has the correct scopes configured for this OpenID Provider.
+Sub, issuer, audience:
+%s %s %s`, claims.Subject, claims.Issuer, claims.Audience), nil
 	} else {
-		return "Email, sub, issuer, audience: \n" + claims.Email + " " + claims.Subject + " " + claims.Issuer + " " + claims.Audience, nil
+		return fmt.Sprintf(`Email, sub, issuer, audience: 
+%s %s %s %s`, claims.Email, claims.Subject, claims.Issuer, claims.Audience), nil
 	}
 }
 

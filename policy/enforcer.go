@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	OIDC_GROUPS         = "oidc:groups:"
+	OIDC_CLAIMS         = "oidc:"
 	OIDC_WILDCARD_EMAIL = "oidc-match-end:email:"
 )
 
@@ -48,26 +48,98 @@ type Enforcer struct {
 
 // type for Identity Token checkedClaims
 type checkedClaims struct {
-	Email  string   `json:"email"`
-	Sub    string   `json:"sub"`
-	Groups []string `json:"groups"`
+	Email       string              `json:"email"`
+	Sub         string              `json:"sub"`
+	ExtraClaims map[string][]string `json:"-"`
+}
+
+func (s *checkedClaims) UnmarshalJSON(data []byte) error {
+
+	// Avoid infinite recursion
+	type checkedClaimsAlias checkedClaims
+	var a checkedClaimsAlias
+
+	// Unmarshal the required claims
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*s = checkedClaims(a)
+
+	// Unmarshal everything else
+	var schema map[string]interface{}
+	err := json.Unmarshal([]byte(data), &schema)
+	if err != nil {
+		return err
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	s.ExtraClaims = make(map[string][]string, len(raw))
+
+	for k, v := range raw {
+		switch t := v.(type) {
+		case string:
+			s.ExtraClaims[k] = []string{t}
+		case []any:
+			// Turn all elements in a list into a string
+			out := make([]string, 0, len(t))
+			for _, e := range t {
+				if s, ok := e.(string); ok {
+					out = append(out, s)
+				} else {
+					out = append(out, fmt.Sprint(e))
+				}
+			}
+			s.ExtraClaims[k] = out
+		default:
+			// Turn numbers/bools etc into strings
+			s.ExtraClaims[k] = []string{fmt.Sprint(t)}
+		}
+	}
+
+	return nil
 }
 
 // The default location for policy plugins
 const pluginPolicyDir = "/etc/opk/policy.d"
 
+// EscapedSplit splits a string by a separator while ignoring the separator in quoted sections.
+// This is useful for strings that may contain the separator character as part of the string
+// and not as a delimiter.
+func EscapedSplit(s string, sep rune) []string {
+	quoted := false
+	a := strings.FieldsFunc(s, func(r rune) bool {
+		if r == '"' {
+			quoted = !quoted
+		}
+		return !quoted && r == sep
+	})
+	return a
+}
+
 // Validates that the server defined identity attribute matches the
 // respective claim from the identity token
 func validateClaim(claims *checkedClaims, user *User) bool {
+	// Should we match on the email claim?
 	if strings.HasPrefix(claims.Email, OIDC_WILDCARD_EMAIL) {
 		return false
 	}
 
-	if strings.HasPrefix(user.IdentityAttribute, OIDC_GROUPS) {
-		oidcGroupSections := strings.Split(user.IdentityAttribute, ":")
+	// Should we match on an oidc claim?
+	if strings.HasPrefix(user.IdentityAttribute, OIDC_CLAIMS) {
+		oidcGroupSections := EscapedSplit(user.IdentityAttribute, ':')
+		oidcGroupsName := strings.Trim(oidcGroupSections[1], "\"")
 
-		return slices.Contains(claims.Groups, oidcGroupSections[len(oidcGroupSections)-1])
+		return slices.Contains(
+			claims.ExtraClaims[oidcGroupsName],
+			oidcGroupSections[len(oidcGroupSections)-1],
+		)
 	}
+
+	// Should we match on the email wildcard claim?
 	wildCardEmailMatch := false
 	if strings.HasPrefix(user.IdentityAttribute, OIDC_WILDCARD_EMAIL) {
 		if strings.HasSuffix(strings.ToLower(claims.Email), strings.ToLower(user.IdentityAttribute[len(OIDC_WILDCARD_EMAIL):len(user.IdentityAttribute)])) {
@@ -87,7 +159,7 @@ func validateClaim(claims *checkedClaims, user *User) bool {
 // It is security critical to verify the pkt first before calling this function.
 // This is because if this function is called first, a timing channel exists which
 // allows an attacker check what identities and principals are allowed by the policy.F
-func (p *Enforcer) CheckPolicy(principalDesired string, pkt *pktoken.PKToken, userInfoJson string, sshCert string, keyType string, denyList DenyList) error {
+func (p *Enforcer) CheckPolicy(principalDesired string, pkt *pktoken.PKToken, userInfoJson string, sshCert string, keyType string, denyList DenyList, extraArgs []string) error {
 
 	var claims checkedClaims
 
@@ -113,7 +185,7 @@ func (p *Enforcer) CheckPolicy(principalDesired string, pkt *pktoken.PKToken, us
 
 	pluginPolicy := plugins.NewPolicyPluginEnforcer()
 
-	results, err := pluginPolicy.CheckPolicies(pluginPolicyDir, pkt, userInfoJson, principalDesired, sshCert, keyType)
+	results, err := pluginPolicy.CheckPolicies(pluginPolicyDir, pkt, userInfoJson, principalDesired, sshCert, keyType, extraArgs)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			log.Println("Skipping policy plugins: no plugins found at " + pluginPolicyDir)

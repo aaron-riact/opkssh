@@ -44,11 +44,11 @@ func NewMockOpenIdSubProvider(t *testing.T, sub string) providers.OpenIdProvider
 	return op
 }
 
-func NewMockOpenIdProviderGroups(t *testing.T, groups []string) providers.OpenIdProvider {
+func NewMockOpenIdProviderGroups(t *testing.T, claimName string, groups []string) providers.OpenIdProvider {
 	providerOpts := providers.DefaultMockProviderOpts()
 	op, _, idTokenTemplate, err := providers.NewMockProvider(providerOpts)
 	require.NoError(t, err)
-	idTokenTemplate.ExtraClaims = map[string]any{"email": "arthur.aardvark@example.com", "groups": groups}
+	idTokenTemplate.ExtraClaims = map[string]any{"email": "arthur.aardvark@example.com", claimName: groups}
 	return op
 }
 
@@ -144,6 +144,11 @@ var policyWithOidcGroup = &policy.Policy{
 			Issuer:            "https://accounts.example.com",
 		},
 		{
+			IdentityAttribute: "oidc:\"https://acme.com/groups\":e",
+			Principals:        []string{"test"},
+			Issuer:            "https://accounts.example.com",
+		},
+		{
 			IdentityAttribute: "oidc-match-end:email:@example2.com",
 			Principals:        []string{"test"},
 		},
@@ -198,7 +203,7 @@ func TestPolicyApproved(t *testing.T) {
 	}
 
 	// Check that policy file is properly parsed and checked
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err)
 }
 
@@ -226,7 +231,7 @@ func TestPolicyEmailDifferentCase(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyWithDiffCapitalizationThanEmail},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err, "user should have access despite email capitalization differences")
 }
 
@@ -253,7 +258,7 @@ func TestPolicySub(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyWithDiffCapitalizationThanEmail},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err, "user should have access on main branch")
 }
 
@@ -271,7 +276,7 @@ func TestPolicyDeniedBadUser(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyTest},
 	}
 
-	err = policyEnforcer.CheckPolicy("baduser", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("baduser", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.Error(t, err, "user should not have access")
 }
 
@@ -289,7 +294,7 @@ func TestPolicyDeniedNoUserEntry(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyTestNoEntry},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.Error(t, err, "user should not have access")
 }
 
@@ -317,14 +322,14 @@ func TestPolicyDeniedWrongIssuer(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyWithDiffCapitalizationThanEmail},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.Error(t, err, "user should not have access due to wrong issuer")
 }
 
 func TestPolicyApprovedOidcGroups(t *testing.T) {
 	t.Parallel()
 
-	op := NewMockOpenIdProviderGroups(t, []string{"a", "b", "c"})
+	op := NewMockOpenIdProviderGroups(t, "groups", []string{"a", "b", "c"})
 
 	opkClient, err := client.New(op)
 	require.NoError(t, err)
@@ -335,14 +340,32 @@ func TestPolicyApprovedOidcGroups(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyWithOidcGroup},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
+	require.NoError(t, err)
+}
+
+func TestPolicyApprovedOidcGroupsUrlClaim(t *testing.T) {
+	t.Parallel()
+
+	op := NewMockOpenIdProviderGroups(t, "https://acme.com/groups", []string{"e"})
+
+	opkClient, err := client.New(op)
+	require.NoError(t, err)
+	pkt, err := opkClient.Auth(context.Background())
+	require.NoError(t, err)
+
+	policyEnforcer := &policy.Enforcer{
+		PolicyLoader: &MockPolicyLoader{Policy: policyWithOidcGroup},
+	}
+
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err)
 }
 
 func TestPolicyApprovedOidcGroupWithAtSign(t *testing.T) {
 	t.Parallel()
 
-	op := NewMockOpenIdProviderGroups(t, []string{"it.infra@my_domain.com"})
+	op := NewMockOpenIdProviderGroups(t, "groups", []string{"it.infra@my_domain.com"})
 
 	policyLine := &policy.Policy{
 		Users: []policy.User{
@@ -363,14 +386,14 @@ func TestPolicyApprovedOidcGroupWithAtSign(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyLine},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err)
 }
 
 func TestPolicyDeniedOidcGroups(t *testing.T) {
 	t.Parallel()
 
-	op := NewMockOpenIdProviderGroups(t, []string{"z"})
+	op := NewMockOpenIdProviderGroups(t, "groups", []string{"z"})
 
 	opkClient, err := client.New(op)
 	require.NoError(t, err)
@@ -381,7 +404,7 @@ func TestPolicyDeniedOidcGroups(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyWithOidcGroup},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.Error(t, err, "user should not as they don't have group 'c'")
 }
 
@@ -399,7 +422,7 @@ func TestPolicyDeniedMissingOidcGroupsClaim(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyWithOidcGroup},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.Error(t, err, "user should not as the token is missing the groups claim")
 }
 
@@ -426,7 +449,7 @@ func TestEnforcerTableTest(t *testing.T) {
 	}{
 		{
 			name:         "Happy path (No userinfo supplied but ID Token has groups claim)",
-			op:           NewMockOpenIdProviderGroups(t, []string{"group1", "group2"}),
+			op:           NewMockOpenIdProviderGroups(t, "groups", []string{"group1", "group2"}),
 			policyLoader: &MockPolicyLoader{Policy: policyWithOidcGroup},
 		},
 		{
@@ -522,7 +545,7 @@ func TestEnforcerTableTest(t *testing.T) {
 				tt.principal = "test"
 			}
 
-			err = policyEnforcer.CheckPolicy(tt.principal, pkt, tt.userInfoJson, "example-base64Cert", "ssh-rsa", tt.denyList)
+			err = policyEnforcer.CheckPolicy(tt.principal, pkt, tt.userInfoJson, "example-base64Cert", "ssh-rsa", tt.denyList, nil)
 			if tt.expectedError != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tt.expectedError)
@@ -550,14 +573,14 @@ func TestWildcardMatchEntry(t *testing.T) {
 	}
 
 	// Check that policy file is properly parsed and checked
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err)
 
 	// now check we can deny that email address, case insensitive
 	denyList := policy.DenyList{
 		Emails: []string{"Some.Guy@WildCarD.com", "email@corp.com"},
 	}
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", denyList)
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", denyList, nil)
 	require.Error(t, err, "user should not have access")
 }
 
@@ -576,14 +599,14 @@ func TestLocalProvider(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyTest},
 	}
 
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.NoError(t, err)
 
 	// now check we can deny that email address, case insensitive
 	denyList := policy.DenyList{
 		Emails: []string{"some.guy@wildcard.com", "eMail@Corp.com"},
 	}
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", denyList)
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", denyList, nil)
 	require.Error(t, err, "user should not have access")
 }
 
@@ -602,6 +625,23 @@ func TestLocalEmail(t *testing.T) {
 		PolicyLoader: &MockPolicyLoader{Policy: policyTest},
 	}
 	// Check that policy file is properly parsed and checked
-	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{})
+	err = policyEnforcer.CheckPolicy("test", pkt, "", "example-base64Cert", "ssh-rsa", policy.DenyList{}, nil)
 	require.Error(t, err, "user should not have access")
+}
+
+func TestEscapedSplit(t *testing.T) {
+	t.Parallel()
+
+	escaped := policy.EscapedSplit("abc:def:ghi", ':')
+	require.Equal(t, []string{"abc", "def", "ghi"}, escaped)
+
+	escaped = policy.EscapedSplit(`abc:"xxx:yyy"`, ':')
+	require.Equal(t, []string{"abc", `"xxx:yyy"`}, escaped)
+
+	escaped = policy.EscapedSplit(`aaa:"bbb:c" zzz:"qqq:www"`, ':')
+	require.Equal(t, []string{"aaa", "\"bbb:c\" zzz", "\"qqq:www\""}, escaped)
+
+	// Escaped strings which prevent the separator from being recognized
+	escaped = policy.EscapedSplit(`abc:\"def:ghi\"`, ':')
+	require.Equal(t, []string{"abc", "\\\"def:ghi\\\""}, escaped)
 }

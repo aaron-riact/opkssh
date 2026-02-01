@@ -10,6 +10,8 @@ We have the follow syntax rules:
 
 Our goal is to have an distinct meaning for each column. This way if we want to extend the rules we can add additional columns.
 
+You can check the correctness of server side config files by running the audit command: `sudo opkssh audit`.
+
 ## Client config `~/.opk/config.yml`
 
 The config file for the client is saved in `~/.opk/config.yml`.
@@ -151,20 +153,29 @@ dev oidc-match-end:email:@example.com https://login.microsoftonline.com/9188040d
 
 These `auth_id` files can be edited by hand or you can use the add command to add new policies. The add command has the following syntax.
 
-`sudo opkssh add {USER} {EMAIL|SUB|GROUP} {ISSUER}`
+`sudo opkssh add <user> <email|sub|claim> <issuer>`
 
 For convenience you can use the shorthand `google`, `azure`, `gitlab` rather than specifying the entire issuer.
 This is especially useful in the case of azure where the issuer contains a long and hard to remember random string.
 
 The following command will allow `alice@example.com` to ssh in as `root`.
 
-Groups must be prefixed with `oidc:group`. So to allow anyone with the group `admin` to ssh in as root you would run the command:
+Claims must be prefixed with `oidc:{CLAIM}` e.g. for the group claim `oidc:group`. To allow anyone with the group `admin` to ssh in as root you would run the command:
 
 ```bash
 sudo opkssh add root oidc:group:admin azure
 ```
 
 Note that currently Google does not put their groups in the ID Token, so groups based auth does not work if you OpenID Provider is Google.
+
+We support policy on claims that are also URIs as this is a common pattern for groups in some systems. 
+To require that root access is only granted to users whose ID Token has a claim `https://acme.com/groups` with the value `ssh-users` run:
+
+```bash
+sudo opkssh add root oidc:\"https://acme.com/groups\":ssh-users google
+```
+
+which will add that line to your OPKSSH policy file.
 
 The system authorized identity file requires the following permissions:
 
@@ -196,5 +207,7 @@ chmod 600 /home/{USER}/.opk/auth_id
 ```
 
 ## See Also
+
+Our documentation on the [audit command](audit.md) for troubleshooting server side configurations. 
 
 Our documentation on the changes our install script makes to a server: [installing.md](../scripts/installing.md)

@@ -1,4 +1,4 @@
-FROM golang:1.24.6@sha256:370491aa174acab224696fac8ad00f1f20c00927283d50204e180ab564ca039a
+FROM golang:1.25.6@sha256:fc24d3881a021e7b968a4610fc024fba749f98fe5c07d4f28e6cfa14dc65a84c
 
 # Update/Upgrade
 RUN apt-get update -y && apt-get upgrade -y
@@ -24,7 +24,8 @@ RUN useradd -rm -d /home/test2 -s /bin/bash -u 1001 test2
 RUN  echo "test2:test" | chpasswd
 
 # Allow SSH access
-RUN mkdir /var/run/sshd
+# This directory is automatically created on the latest docker image
+# RUN mkdir /var/run/sshd
 
 # Expose SSH server so we can ssh in from the tests
 EXPOSE 22

@@ -1,4 +1,4 @@
-FROM ubuntu:noble@sha256:7c06e91f61fa88c08cc74f7e1b7c69ae24910d745357e0dfe1d2c0322aaf20f9
+FROM ubuntu:noble
 
 # Update/Upgrade
 RUN apt-get update -y && apt-get upgrade -y
@@ -15,7 +15,8 @@ RUN useradd -rm -d /home/test -s /bin/bash -g root -G sudo -u 1000 test
 RUN echo 'test:test' | chpasswd
 
 # Allow SSH access
-RUN mkdir /var/run/sshd
+# This directory is automatically created on the latest docker image
+# RUN mkdir /var/run/sshd
 
 # Expose SSH server so we can ssh in from the tests
 EXPOSE 22

@@ -17,6 +17,7 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ed25519"
@@ -57,7 +59,7 @@ const providerStr3 = providerAlias3 + "," + providerArg3
 
 const allProvidersStr = providerStr1 + ";" + providerStr2 + ";" + providerStr3
 
-func Mocks(t *testing.T, keyType KeyType) (*pktoken.PKToken, crypto.Signer, providers.OpenIdProvider) {
+func Mocks(t *testing.T, keyType KeyType, extraClaims ...map[string]any) (*pktoken.PKToken, crypto.Signer, providers.OpenIdProvider) {
 	var err error
 	var alg jwa.SignatureAlgorithm
 	var signer crypto.Signer
@@ -76,9 +78,14 @@ func Mocks(t *testing.T, keyType KeyType) (*pktoken.PKToken, crypto.Signer, prov
 	op, _, idtTemplate, err := providers.NewMockProvider(providerOpts)
 	require.NoError(t, err)
 
-	mockEmail := "arthur.aardvark@example.com"
-	idtTemplate.ExtraClaims = map[string]any{
-		"email": mockEmail,
+	// Default: include email claim
+	if len(extraClaims) > 0 {
+		idtTemplate.ExtraClaims = extraClaims[0]
+	} else {
+		mockEmail := "arthur.aardvark@example.com"
+		idtTemplate.ExtraClaims = map[string]any{
+			"email": mockEmail,
+		}
 	}
 
 	client, err := client.New(op, client.WithSigner(signer, alg))
@@ -139,6 +146,16 @@ func TestLoginCmd(t *testing.T) {
 			wantError: false,
 		},
 		{
+			name:    "Good path PrintKey",
+			envVars: map[string]string{},
+			loginCmd: LoginCmd{
+				Verbosity:   0,
+				PrintKeyArg: true,
+				LogDirArg:   logDir,
+			},
+			wantError: false,
+		},
+		{
 			name:    "Good path with SendAccessToken set in arg and config",
 			envVars: map[string]string{},
 			loginCmd: LoginCmd{
@@ -194,6 +211,10 @@ func TestLoginCmd(t *testing.T) {
 				tt.loginCmd.overrideProvider = &mockOp
 				tt.loginCmd.Fs = mockFs
 
+				// Allows us to capture non-logged CLI output
+				cliOutputBuffer := &bytes.Buffer{}
+				tt.loginCmd.OutWriter = cliOutputBuffer
+
 				err = tt.loginCmd.Run(context.Background())
 				if tt.wantError {
 					require.Error(t, err, "Expected error but got none")
@@ -203,29 +224,38 @@ func TestLoginCmd(t *testing.T) {
 				} else {
 					require.NoError(t, err, "Unexpected error")
 
-					homePath, err := os.UserHomeDir()
-					require.NoError(t, err)
+					var pubKeyBytes []byte
 
-					sshPath := filepath.Join(homePath, ".ssh", "id_ecdsa")
-					secKeyBytes, err := afero.ReadFile(mockFs, sshPath)
-					require.NoError(t, err)
-					require.NotNil(t, secKeyBytes)
-					require.Contains(t, string(secKeyBytes), "-----BEGIN OPENSSH PRIVATE KEY-----")
+					if tt.loginCmd.PrintKeyArg {
+						got := cliOutputBuffer.String()
+						gotLines := strings.Split(strings.TrimSpace(got), "\n")
+						require.GreaterOrEqual(t, len(gotLines), 2, "expected at least 2 lines in output")
+						require.Contains(t, gotLines[0], "cert-v01@openssh.com AAAA")
+						require.Contains(t, gotLines[1], "-----BEGIN OPENSSH PRIVATE KEY-----")
+						pubKeyBytes = []byte(gotLines[0])
+					} else {
+						homePath, err := os.UserHomeDir()
+						require.NoError(t, err)
 
-					logBytes, err := afero.ReadFile(mockFs, logPath)
-					require.NoError(t, err)
-					require.NotNil(t, logBytes)
-					require.Contains(t, string(logBytes), "running login command with args:")
+						sshPath := filepath.Join(homePath, ".ssh", "id_ecdsa")
+						secKeyBytes, err := afero.ReadFile(mockFs, sshPath)
+						require.NoError(t, err)
+						require.NotNil(t, secKeyBytes)
+						require.Contains(t, string(secKeyBytes), "-----BEGIN OPENSSH PRIVATE KEY-----")
 
-					sshPubPath := filepath.Join(homePath, ".ssh", "id_ecdsa-cert.pub")
-					pubKeyBytes, err := afero.ReadFile(mockFs, sshPubPath)
-					require.NoError(t, err)
+						logBytes, err := afero.ReadFile(mockFs, logPath)
+						require.NoError(t, err)
+						require.NotNil(t, logBytes)
+						require.Contains(t, string(logBytes), "running login command with args:")
 
+						sshPubPath := filepath.Join(homePath, ".ssh", "id_ecdsa-cert.pub")
+						pubKeyBytes, err = afero.ReadFile(mockFs, sshPubPath)
+						require.NoError(t, err)
+					}
 					certSmug, err := sshcert.NewFromAuthorizedKey("fake-cert-type", string(pubKeyBytes))
 					require.NoError(t, err)
 
 					accToken := certSmug.GetAccessToken()
-
 					if tt.wantAccessToken {
 						require.NotEmpty(t, accToken, "expected access token to be set in SSH cert")
 					} else {
@@ -239,14 +269,15 @@ func TestLoginCmd(t *testing.T) {
 
 func TestDetermineProvider(t *testing.T) {
 	tests := []struct {
-		name          string
-		envVars       map[string]string
-		providerArg   string
-		providerAlias string
-		wantIssuer    string
-		wantChooser   string
-		wantError     bool
-		errorString   string
+		name              string
+		envVars           map[string]string
+		providerArg       string
+		providerAlias     string
+		remoteRedirectURI string
+		wantIssuer        string
+		wantChooser       string
+		wantError         bool
+		errorString       string
 	}{
 		{
 			name:          "Good path with env vars",
@@ -280,7 +311,7 @@ func TestDetermineProvider(t *testing.T) {
 			wantIssuer:    "",
 			wantError:     false,
 			errorString:   "",
-			wantChooser:   `[{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000}]`,
+			wantChooser:   `[{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null}]`,
 		},
 		{
 			name:          "Good path with env vars many providers and no default",
@@ -289,7 +320,7 @@ func TestDetermineProvider(t *testing.T) {
 			providerAlias: "",
 			wantIssuer:    "",
 			wantError:     false,
-			wantChooser:   `[{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000},{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000},{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000}]`,
+			wantChooser:   `[{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null},{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null},{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null}]`,
 		},
 		{
 			name:          "Good path with env vars many providers and providerAlias",
@@ -306,6 +337,24 @@ func TestDetermineProvider(t *testing.T) {
 			providerAlias: "",
 			wantIssuer:    providerIssuer3,
 			wantError:     false,
+		},
+		{
+			name:              "Good path remoteRedirectURI set (no default)",
+			envVars:           map[string]string{"OPKSSH_DEFAULT": "", "OPKSSH_PROVIDERS": allProvidersStr},
+			providerArg:       "",
+			providerAlias:     "",
+			remoteRedirectURI: "https://example.com/login_callback",
+			wantChooser:       `[{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"https://example.com/login_callback","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null},{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"https://example.com/login_callback","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null},{"ClientSecret":"","Scopes":["openid profile email"],"PromptType":"consent","AccessType":"offline","RedirectURIs":["http://localhost:3000/login-callback","http://localhost:10001/login-callback","http://localhost:11110/login-callback"],"RemoteRedirectURI":"https://example.com/login_callback","GQSign":false,"OpenBrowser":false,"HttpClient":null,"IssuedAtOffset":60000000000,"ExtraURLParamOpts":null}]`,
+			wantError:         false,
+		},
+		{
+			name:              "Good path remoteRedirectURI set (with default)",
+			envVars:           map[string]string{"OPKSSH_DEFAULT": providerAlias3, "OPKSSH_PROVIDERS": allProvidersStr},
+			providerArg:       "",
+			providerAlias:     "",
+			remoteRedirectURI: "https://example.com/login_callback",
+			wantIssuer:        providerIssuer3,
+			wantError:         false,
 		},
 	}
 
@@ -327,6 +376,7 @@ func TestDetermineProvider(t *testing.T) {
 				ProviderArg:           tt.providerArg,
 				ProviderAliasArg:      tt.providerAlias,
 				PrintIdTokenArg:       true,
+				RemoteRedirectURI:     tt.remoteRedirectURI,
 				Config:                defaultConfig,
 			}
 
@@ -351,12 +401,21 @@ func TestDetermineProvider(t *testing.T) {
 
 				if provider != nil {
 					require.Equal(t, provider.Issuer(), tt.wantIssuer)
+
+					if tt.remoteRedirectURI != "" {
+						// This only covers the case where a single provider is selected.
+						// We handle the chooser case by matching against the expected JSON.
+						unwrappedOp, ok := provider.(*providers.StandardOp)
+						require.True(t, ok, "Expected provider to be of type StandardOp")
+						require.Equal(t, tt.remoteRedirectURI, unwrappedOp.RemoteRedirectURI)
+					}
 				} else {
 					require.NotNil(t, chooser.OpList, "Chooser OpList should not be nil")
 					jsonBytes, err := json.Marshal(chooser.OpList)
 					require.NoError(t, err)
 					require.Equal(t, tt.wantChooser, string(jsonBytes))
 				}
+
 			}
 		})
 	}
@@ -374,10 +433,12 @@ func TestNewLogin(t *testing.T) {
 	providerArg := ""
 	keyPathArg := ""
 	providerAlias := ""
+	keyAsOutputArg := false
 	keyTypeArg := ECDSA
+	remoteRedirectURIArg := ""
 
 	loginCmd := NewLogin(autoRefresh, configPathArg, createConfig, configureArg, logDir,
-		sendAccessTokenArg, disableBrowserOpenArg, printIdTokenArg, providerArg, keyPathArg, providerAlias, keyTypeArg)
+		sendAccessTokenArg, disableBrowserOpenArg, printIdTokenArg, providerArg, keyAsOutputArg, keyPathArg, providerAlias, keyTypeArg, remoteRedirectURIArg)
 	require.NotNil(t, loginCmd)
 }
 
@@ -415,11 +476,27 @@ func TestCreateSSHCert(t *testing.T) {
 }
 
 func TestIdentityString(t *testing.T) {
-	pkt, _, _ := Mocks(t, ECDSA)
-	idString, err := IdentityString(*pkt)
-	require.NoError(t, err)
-	expIdString := "Email, sub, issuer, audience: \narthur.aardvark@example.com me https://accounts.example.com test_client_id"
-	require.Equal(t, expIdString, idString)
+	t.Run("with email claim", func(t *testing.T) {
+		pkt, _, _ := Mocks(t, ECDSA)
+		idString, err := IdentityString(*pkt)
+		require.NoError(t, err)
+		expIdString := "Email, sub, issuer, audience: \narthur.aardvark@example.com me https://accounts.example.com test_client_id"
+		require.Equal(t, expIdString, idString)
+	})
+
+	t.Run("without email claim", func(t *testing.T) {
+		// Create a mock without email claim by passing empty ExtraClaims
+		pkt, _, _ := Mocks(t, ECDSA, map[string]any{})
+
+		idString, err := IdentityString(*pkt)
+		require.NoError(t, err)
+		require.Contains(t, idString, "WARNING: Email claim is missing from ID token")
+		require.Contains(t, idString, "Policies based on email will not work")
+		require.Contains(t, idString, "Sub, issuer, audience:")
+		require.Contains(t, idString, "me")                           // subject
+		require.Contains(t, idString, "https://accounts.example.com") // issuer
+		require.Contains(t, idString, "test_client_id")               // audience
+	})
 }
 
 func TestPrettyPrintIdToken(t *testing.T) {

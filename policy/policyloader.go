@@ -31,6 +31,10 @@ import (
 // defined
 var SystemDefaultPolicyPath = filepath.FromSlash("/etc/opk/auth_id")
 
+// SystemDefaultProvidersPath is the default filepath where opkssh provider
+// definitions are configured
+var SystemDefaultProvidersPath = filepath.FromSlash("/etc/opk/providers")
+
 // UserLookup defines the minimal interface to lookup users on the current
 // system
 type UserLookup interface {
@@ -68,7 +72,7 @@ func (l *PolicyLoader) LoadPolicyAtPath(path string) (*Policy, error) {
 		return nil, err
 	}
 
-	policy := FromTable(content, path)
+	policy, _ := FromTable(content, path)
 	return policy, nil
 }
 
@@ -174,7 +178,7 @@ func (h *HomePolicyLoader) LoadHomePolicy(username string, skipInvalidEntries bo
 			return nil, "", fmt.Errorf("failed to read user policy file %s: %w", policyFilePath, userPolicyErr)
 		}
 	}
-	policy := FromTable(policyBytes, policyFilePath)
+	policy, _ := FromTable(policyBytes, policyFilePath)
 
 	if skipInvalidEntries {
 		// Build valid user policy. Ignore user entries that give access to a

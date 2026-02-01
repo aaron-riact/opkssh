@@ -25,18 +25,23 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"regexp"
 	"strings"
 	"syscall"
-
-	"github.com/thediveo/enumflag/v2"
+	"text/tabwriter"
 
 	"github.com/openpubkey/opkssh/commands"
+	config "github.com/openpubkey/opkssh/commands/config"
+	"github.com/openpubkey/opkssh/internal/sysdetails"
 	"github.com/openpubkey/opkssh/policy"
 	"github.com/openpubkey/opkssh/policy/files"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/spf13/cobra/doc"
+	"github.com/thediveo/enumflag/v2"
+	"golang.org/x/mod/semver"
+	"golang.org/x/term"
 )
 
 var (
@@ -72,16 +77,16 @@ This program allows users to:
 
 	addCmd := &cobra.Command{
 		SilenceUsage: true,
-		Use:          "add <PRINCIPAL> <EMAIL|SUB|GROUP> <ISSUER>",
+		Use:          "add <principal> <email|sub|group> <issuer>",
 		Short:        "Appends new rule to the policy file",
 		Long: `Add appends a new policy entry in the auth_id policy file granting SSH access to the specified email or subscriber ID (sub) or group.
 
 It first attempts to write to the system-wide file (/etc/opk/auth_id). If it lacks permissions to update this file it falls back to writing to the user-specific file (~/.opk/auth_id).
 
 Arguments:
-  PRINCIPAL            The target user account (requested principal).
-  EMAIL|SUB|GROUP      Email address, subscriber ID or group authorized to assume this principal. If using an OIDC group, the argument needs to be in the format of oidc:groups:<groupId>.
-  ISSUER               OpenID Connect provider (issuer) URL associated with the email/sub/group.
+  principal            The target user account (requested principal).
+  email|sub|group      Email address, subscriber ID or group authorized to assume this principal. If using an OIDC group, the argument needs to be in the format of oidc:groups:<groupId>.
+  issuer               OpenID Connect provider (issuer) URL associated with the email/sub/group.
 `,
 		Args: cobra.ExactArgs(3),
 		Example: `  opkssh add root alice@example.com https://accounts.google.com
@@ -120,6 +125,24 @@ Arguments:
 	}
 	rootCmd.AddCommand(addCmd)
 
+	inspectCmd := &cobra.Command{
+		SilenceUsage: true,
+		Use:          "inspect <path>",
+		Short:        "Inspect and view details of an opkssh generated SSH key",
+		Example:      "  opkssh inspect ~/.ssh/id_ecdsa_sk-cert.pub",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			keyPathArg := args[0]
+			inspect := commands.NewInspectCmd(keyPathArg, cmd.OutOrStdout())
+			if err := inspect.Run(); err != nil {
+				log.Println("Error executing inspect command:", err)
+				return err
+			}
+			return nil
+		},
+		Args: cobra.ExactArgs(1),
+	}
+	rootCmd.AddCommand(inspectCmd)
+
 	var autoRefreshArg bool
 	var configPathArg string
 	var createConfigArg bool
@@ -129,8 +152,11 @@ Arguments:
 	var sendAccessTokenArg bool
 	var disableBrowserOpenArg bool
 	var printIdTokenArg bool
+	var printKeyArg bool
 	var keyPathArg string
 	var keyTypeArg commands.KeyType
+	var remoteRedirectURIArg string
+
 	loginCmd := &cobra.Command{
 		SilenceUsage: true,
 		Use:          "login [alias]",
@@ -161,7 +187,9 @@ Arguments:
 				providerAliasArg = args[0]
 			}
 
-			login := commands.NewLogin(autoRefreshArg, configPathArg, createConfigArg, configureArg, logDirArg, sendAccessTokenArg, disableBrowserOpenArg, printIdTokenArg, providerArg, keyPathArg, providerAliasArg, keyTypeArg)
+			login := commands.NewLogin(autoRefreshArg, configPathArg, createConfigArg, configureArg, logDirArg,
+				sendAccessTokenArg, disableBrowserOpenArg, printIdTokenArg, providerArg, printKeyArg, keyPathArg,
+				providerAliasArg, keyTypeArg, remoteRedirectURIArg)
 			if err := login.Run(ctx); err != nil {
 				log.Println("Error executing login command:", err)
 				return err
@@ -181,15 +209,17 @@ Arguments:
 	loginCmd.Flags().BoolVar(&printIdTokenArg, "print-id-token", false, "Set this flag to print out the contents of the id_token. Useful for inspecting claims")
 	loginCmd.Flags().BoolVar(&sendAccessTokenArg, "send-access-token", false, "Set this flag to send the Access Token as well as the PK Token in the SSH cert. The Access Token is used to call the userinfo endpoint to get claims not included in the ID Token")
 	loginCmd.Flags().StringVar(&providerArg, "provider", "", "OpenID Provider specification in the format: <issuer>,<client_id> or <issuer>,<client_id>,<client_secret> or <issuer>,<client_id>,<client_secret>,<scopes>")
+	loginCmd.Flags().BoolVarP(&printKeyArg, "print-key", "p", false, "Print private key and SSH cert instead of writing them to the filesystem")
 	loginCmd.Flags().StringVarP(&keyPathArg, "private-key-file", "i", "", "Path where private keys is written")
+	loginCmd.Flags().StringVar(&remoteRedirectURIArg, "remote-redirect-uri", "", "Remote redirect URI used for non-localhost redirects. This is an advanced option for embedding opkssh in server-side logic.")
 	loginCmd.Flags().VarP(enumflag.New(&keyTypeArg, "Key Type", map[commands.KeyType][]string{commands.ECDSA: {commands.ECDSA.String()}, commands.ED25519: {commands.ED25519.String()}}, enumflag.EnumCaseInsensitive), "key-type", "t", "Type of key to generate")
 	rootCmd.AddCommand(loginCmd)
 
 	readhomeCmd := &cobra.Command{
 		SilenceUsage: true,
-		Use:          "readhome <PRINCIPAL>",
+		Use:          "readhome <principal>",
 		Short:        "Read the principal's home policy file",
-		Long: `Read the principal's policy file (/home/<PRINCIPAL>/.opk/auth_id).
+		Long: `Read the principal's policy file (/home/<principal>/.opk/auth_id).
 
 You should not call this command directly. It is called by the opkssh verify command as part of the AuthorizedKeysCommand process to read the user's policy  (principals) home file (~/.opk/auth_id) with sudoer permissions. This allows us to use an unprivileged user as the AuthorizedKeysCommand user.
 `,
@@ -211,7 +241,7 @@ You should not call this command directly. It is called by the opkssh verify com
 	var serverConfigPathArg string
 	verifyCmd := &cobra.Command{
 		SilenceUsage: true,
-		Use:          "verify <PRINCIPAL> <CERT> <KEY_TYPE>",
+		Use:          "verify <principal> <cert> <key_type>",
 		Short:        "Verify an SSH key (used by sshd AuthorizedKeysCommand)",
 		Long: `Verify extracts a PK token from a base64-encoded SSH certificate and verifies it against policy. It expects an allowed provider file at /etc/opk/providers and a user policy file at either /etc/opk/auth_id or ~/.opk/auth_id.
 
@@ -235,10 +265,10 @@ Verification checks performed:
 If all checks pass, Verify authorizes the SSH connection.
 
 Arguments:
-  PRINCIPAL    Target username.
-  CERT         Base64-encoded SSH certificate.
-  KEY_TYPE     SSH certificate key type (e.g., ecdsa-sha2-nistp256-cert-v01@openssh.com)`,
-		Args:    cobra.ExactArgs(3),
+  principal    Target username.
+  cert         Base64-encoded SSH certificate.
+  key_type     SSH certificate key type (e.g., ecdsa-sha2-nistp256-cert-v01@openssh.com)`,
+		Args:    cobra.MinimumNArgs(3),
 		Example: `  opkssh verify root <base64-encoded-cert> ecdsa-sha2-nistp256-cert-v01@openssh.com`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
@@ -264,6 +294,7 @@ Arguments:
 			userArg := args[0]
 			certB64Arg := args[1]
 			typArg := args[2]
+			extraArgs := args[3:]
 
 			providerPolicyPath := "/etc/opk/providers"
 			providerPolicy, err := policy.NewProviderFileLoader().LoadProviderPolicy(providerPolicyPath)
@@ -286,7 +317,7 @@ Arguments:
 				log.Println("Failed to set environment variables in config:", err)
 			}
 
-			if authKey, err := v.AuthorizedKeysCommand(ctx, userArg, typArg, certB64Arg); err != nil {
+			if authKey, err := v.AuthorizedKeysCommand(ctx, userArg, typArg, certB64Arg, extraArgs); err != nil {
 				log.Println("failed to verify:", err)
 				return err
 			} else {
@@ -299,6 +330,158 @@ Arguments:
 	}
 	verifyCmd.Flags().StringVar(&serverConfigPathArg, "config-path", "/etc/opk/config.yml", "Path to the server config file. Default: /etc/opk/config.yml.")
 	rootCmd.AddCommand(verifyCmd)
+
+	auditCmd := &cobra.Command{
+		SilenceUsage: true,
+		Use:          "audit",
+		Short:        "Validate policy file entries against provider definitions",
+		Long: `Audit validates all entries in /etc/opk/auth_id and ~/.opk/auth_id against the provider definitions in /etc/opk/providers. For complete audit details use the --json flag. Returns a non-zero exit code if any warnings or errors are found.
+
+The audit command checks that:
+  - Each issuer in policy files is defined in the providers file
+  - The protocol (http:// or https://) exactly matches between policy and provider files
+  - The auth_id policy files do not throw parsing errors
+
+Results are reported with the following status:
+  SUCCESS  - Entry is valid
+  WARNING  - Entry is valid but may cause problems
+  ERROR    - Entry has issues (missing provider, protocol mismatch, etc.)
+
+Exit code: 0 if all entries are valid, 1 if any warnings or errors are found.`,
+		Example: `  opkssh audit`,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			audit := commands.NewAuditCmd(os.Stdout, os.Stderr)
+
+			// Apply command-line flags
+			providersFile, _ := cmd.Flags().GetString("providers-file")
+			if providersFile != "" {
+				audit.ProviderPath = providersFile
+			}
+
+			policyFile, _ := cmd.Flags().GetString("policy-file")
+			if policyFile != "" {
+				audit.PolicyPath = policyFile
+			}
+
+			skipUser, _ := cmd.Flags().GetBool("skip-user-policy")
+			audit.SkipUserPolicy = skipUser
+
+			audit.JsonOutput, _ = cmd.Flags().GetBool("json")
+			return audit.Run(Version)
+		},
+	}
+
+	auditCmd.Flags().String("providers-file", "/etc/opk/providers", "Path to providers file")
+	auditCmd.Flags().String("policy-file", "/etc/opk/auth_id", "Path to policy file")
+	auditCmd.Flags().Bool("skip-user-policy", false, "Skip auditing user policy file (~/.opk/auth_id)")
+	auditCmd.Flags().BoolP("json", "j", false, "Output complete audit results in JSON")
+
+	rootCmd.AddCommand(auditCmd)
+
+	clientCmd := &cobra.Command{
+		Use:     "client [subcommand]",
+		Short:   "Interact with client configuration",
+		Example: `  opkssh client provider list`,
+		Args:    cobra.ExactArgs(0),
+	}
+
+	providerCmd := &cobra.Command{
+		Use:     "provider [subcommand]",
+		Short:   "Interact with provider configuration",
+		Example: `  opkssh client provider list`,
+		Args:    cobra.ExactArgs(0),
+	}
+
+	providerListCmd := &cobra.Command{
+		Use:     "list",
+		Short:   "List configured providers",
+		Example: `  opkssh client provider list`,
+		Args:    cobra.ExactArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client_config, err := config.GetClientConfigFromFile(configPathArg, afero.NewOsFs())
+
+			if err != nil {
+				log.Fatal("Unable to load providers. ", err)
+			}
+
+			isTTY := term.IsTerminal(int(os.Stdout.Fd()))
+
+			var w *tabwriter.Writer
+			if isTTY {
+				// Nice aligned table for TTY output
+				w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "Alias\tIssuer")
+				fmt.Fprintln(w, "-----\t------")
+			} else {
+				// Simpler formatting for non-TTY (e.g., when piping to a file)
+				w = tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', tabwriter.DiscardEmptyColumns)
+			}
+
+			for _, p := range client_config.Providers {
+				for _, alias := range p.AliasList {
+					fmt.Fprintf(w, "%s\t%s\n", alias, p.Issuer)
+				}
+			}
+			w.Flush()
+
+			// and lets check it can be loaded into a map, after we print the contents
+			if _, err = config.CreateProvidersMap(client_config.Providers); err != nil {
+				log.Fatal("Unable to parse providers. ", err)
+			}
+
+			return nil
+		},
+	}
+
+	providerListCmd.Flags().StringVar(&configPathArg, "config-path", "", "Path to the client config file. Default: ~/.opk/config.yml on linux and %APPDATA%\\.opk\\config.yml on windows.")
+
+	providerCmd.AddCommand(providerListCmd)
+
+	initConfigCmd := &cobra.Command{
+		Use:     "init-config",
+		Short:   "Initialize client provider configuration",
+		Example: `  opkssh client init-config`,
+		Args:    cobra.ExactArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			err := config.CreateDefaultClientConfig(configPathArg, afero.NewOsFs())
+
+			if err != nil {
+				log.Fatal("Unable to initialize provider configuration. ", err)
+			}
+			return nil
+		},
+	}
+
+	initConfigCmd.Flags().StringVar(&configPathArg, "config-path", "", "Path to the client config file. Default: ~/.opk/config.yml on linux and %APPDATA%\\.opk\\config.yml on windows.")
+
+	clientCmd.AddCommand(initConfigCmd)
+
+	clientCmd.AddCommand(providerCmd)
+
+	rootCmd.AddCommand(clientCmd)
+
+	// genDocsCmd is a hidden command used as a helper for generating our
+	// command line reference documentation.
+	genDocsCmd := &cobra.Command{
+		Use:    "gendocs <output_dir>",
+		Hidden: true,
+		Args:   cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "./docs/cli/"
+			if len(args) > 1 {
+				path = args[1]
+			}
+
+			err := os.MkdirAll(path, 0775)
+			if err != nil {
+				return err
+			}
+
+			return doc.GenMarkdownTree(rootCmd, path)
+		},
+	}
+	rootCmd.AddCommand(genDocsCmd)
 
 	err := rootCmd.Execute()
 	if err != nil {
@@ -325,7 +508,7 @@ func printConfigProblems() {
 // system running the verifier is greater than or equal to 8.1;
 // if not then prints a warning
 func checkOpenSSHVersion() {
-	version := getOpenSSHVersion()
+	version := sysdetails.GetOpenSSHVersion()
 	if version == "" {
 		log.Println("Warning: Could not determine OpenSSH version")
 		return
@@ -336,64 +519,7 @@ func checkOpenSSHVersion() {
 	}
 }
 
-// getOpenSSHVersion attempts to get OpenSSH version using multiple fallback methods
-func getOpenSSHVersion() string {
-	// OS-specific package manager queries
-	osType := detectOS()
-	log.Printf("Attempting OS-specific version detection for: %s", osType)
-
-	switch osType {
-	case OSTypeRHEL:
-		// For RedHat-based systems (CentOS, RHEL, Fedora)
-		cmd := exec.Command("/bin/sh", "-c", "version=$(/usr/bin/rpm -q --qf \"%{VERSION}\\n\" openssh-server 2>/dev/null | /bin/sed -E 's/^([0-9]+\\.[0-9]+).*/\\1/' | head -1); if [ -n \"$version\" ]; then /bin/echo \"OpenSSH_$version\"; fi")
-		if output, err := cmd.CombinedOutput(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
-			return strings.TrimSpace(string(output))
-		}
-
-	case OSTypeDebian:
-		// For Debian-based systems (Debian, Ubuntu)
-		cmd := exec.Command("/bin/sh", "-c", "version=$(/usr/bin/dpkg-query -W -f='${Version}\\n' openssh-server 2>/dev/null | /bin/sed -E 's/^[0-9]*:?([0-9]+\\.[0-9]+).*/\\1/' | head -1); if [ -n \"$version\" ]; then /bin/echo \"OpenSSH_$version\"; fi")
-		if output, err := cmd.CombinedOutput(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
-			return strings.TrimSpace(string(output))
-		}
-
-	case OSTypeArch:
-		// For Arch Linux
-		cmd := exec.Command("/bin/sh", "-c", "version=$(/usr/bin/pacman -Qi openssh 2>/dev/null | /usr/bin/awk '/^Version/ {print $3}' | /bin/sed -E 's/^([0-9]+\\.[0-9]+).*/\\1/' | head -1); if [ -n \"$version\" ]; then /bin/echo \"OpenSSH_$version\"; fi")
-		if output, err := cmd.CombinedOutput(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
-			return strings.TrimSpace(string(output))
-		}
-
-	case OSTypeSUSE:
-		// For SUSE-based systems
-		cmd := exec.Command("/bin/sh", "-c", "version=$(/usr/bin/rpm -q --qf \"%{VERSION}\\n\" openssh 2>/dev/null | /bin/sed -E 's/^([0-9]+\\.[0-9]+).*/\\1/' | head -1); if [ -n \"$version\" ]; then /bin/echo \"OpenSSH_$version\"; fi")
-		if output, err := cmd.CombinedOutput(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
-			return strings.TrimSpace(string(output))
-		}
-	default:
-		log.Printf("Warning: Could not determine OpenSSH version using OS-specific methods for %s", osType)
-	}
-
-	// Try ssh -V (works on most systems)
-	cmd := exec.Command("ssh", "-V")
-	output, err := cmd.CombinedOutput()
-	if err == nil && len(strings.TrimSpace(string(output))) > 0 {
-		return strings.TrimSpace(string(output))
-	}
-	log.Println("Warning: Error executing ssh -V:", err)
-
-	// Try sshd -V as fallback
-	cmd = exec.Command("sshd", "-V")
-	output, err = cmd.CombinedOutput()
-	if err == nil && len(strings.TrimSpace(string(output))) > 0 {
-		return strings.TrimSpace(string(output))
-	}
-	log.Println("Warning: Error executing sshd -V:", err)
-
-	return ""
-}
-
-func isOpenSSHVersion8Dot1OrGreater(opensshVersion string) (bool, error) {
+func isOpenSSHVersion8Dot1OrGreater(opensshVersionStr string) (bool, error) {
 	// To handle versions like 9.9p1; we only need the initial numeric part for the comparison
 	re, err := regexp.Compile(`^(\d+(?:\.\d+)*).*`)
 	if err != nil {
@@ -401,8 +527,8 @@ func isOpenSSHVersion8Dot1OrGreater(opensshVersion string) (bool, error) {
 		return false, err
 	}
 
-	opensshVersion = strings.TrimPrefix(
-		strings.Split(opensshVersion, ", ")[0],
+	opensshVersion := strings.TrimPrefix(
+		strings.Split(opensshVersionStr, ", ")[0],
 		"OpenSSH_",
 	)
 
@@ -413,73 +539,12 @@ func isOpenSSHVersion8Dot1OrGreater(opensshVersion string) (bool, error) {
 		return false, errors.New("invalid OpenSSH version")
 	}
 
-	version := matches[1]
-
-	if version >= "8.1" {
+	version := "v" + matches[1] // semver requires that version strings start with 'v'
+	// OpenSSH doesn't use semantic versioning, but does use major.minor which after stripping the patch version can be compared using semver
+	if semver.Compare(version, "v8.1.0") >= 0 {
+		// if version is greater than or equal to v8.1.0
 		return true, nil
 	}
 
 	return false, nil
-}
-
-// OSType represents the operating system type
-type OSType string
-
-// Operating system constants
-const (
-	OSTypeGeneric OSType = "generic"
-	OSTypeRHEL    OSType = "rhel"
-	OSTypeDebian  OSType = "debian"
-	OSTypeArch    OSType = "arch"
-	OSTypeSUSE    OSType = "suse"
-)
-
-// detectOS determines the type of operating system.
-func detectOS() OSType {
-	// Check for RedHat-based systems
-	if _, err := os.Stat("/etc/redhat-release"); err == nil {
-		return OSTypeRHEL
-	}
-
-	// Check for Debian-based systems
-	if _, err := os.Stat("/etc/debian_version"); err == nil {
-		return OSTypeDebian
-	}
-
-	// Check for Arch Linux
-	if _, err := os.Stat("/etc/arch-release"); err == nil {
-		return OSTypeArch
-	}
-
-	// Check for SUSE Linux
-	if _, err := os.Stat("/etc/SuSE-release"); err == nil {
-		return OSTypeSUSE
-	}
-	if _, err := os.Stat("/etc/SUSE-brand"); err == nil {
-		return OSTypeSUSE
-	}
-
-	// Check for /etc/os-release which exists on most modern Linux systems
-	if content, err := os.ReadFile("/etc/os-release"); err == nil {
-		contentStr := string(content)
-		if strings.Contains(contentStr, "ID=rhel") ||
-			strings.Contains(contentStr, "ID=centos") ||
-			strings.Contains(contentStr, "ID=fedora") {
-			return OSTypeRHEL
-		}
-		if strings.Contains(contentStr, "ID=debian") ||
-			strings.Contains(contentStr, "ID=ubuntu") {
-			return OSTypeDebian
-		}
-		if strings.Contains(contentStr, "ID=arch") {
-			return OSTypeArch
-		}
-		if strings.Contains(contentStr, "ID=sles") ||
-			strings.Contains(contentStr, "ID=opensuse") {
-			return OSTypeSUSE
-		}
-	}
-
-	// Default to generic, if no specific OS type is detected.
-	return OSTypeGeneric
 }
