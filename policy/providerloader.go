@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/openpubkey/openpubkey/discover"
 	"github.com/openpubkey/openpubkey/providers"
 	"github.com/openpubkey/openpubkey/verifier"
 	"github.com/openpubkey/opkssh/policy/files"
@@ -69,40 +70,38 @@ func (p *ProviderPolicy) GetRows() []ProvidersRow {
 	return p.rows
 }
 
+// VerifierOptions contains options for creating a verifier
+type VerifierOptions struct {
+	// PublicKeyFinder is a custom public key finder (e.g., with caching)
+	// If nil, the default finder is used
+	PublicKeyFinder *discover.PublicKeyFinder
+}
+
+// CreateVerifier creates a verifier with default options (no caching)
 func (p *ProviderPolicy) CreateVerifier() (*verifier.Verifier, error) {
+	return p.CreateVerifierWithOptions(VerifierOptions{})
+}
+
+// CreateVerifierWithOptions creates a verifier with the provided options
+func (p *ProviderPolicy) CreateVerifierWithOptions(opts VerifierOptions) (*verifier.Verifier, error) {
 	pvs := []verifier.ProviderVerifier{}
 	var expirationPolicy verifier.ExpirationPolicy
 	var err error
 	for _, row := range p.rows {
-		var provider verifier.ProviderVerifier
-		// TODO: We should handle this issuer matching in a more generic way
-		// oidc.local and localhost: are a test issuers
-		if row.Issuer == "https://accounts.google.com" ||
-			strings.HasPrefix(row.Issuer, "http://oidc.local") ||
-			strings.HasPrefix(row.Issuer, "http://localhost:") {
+		// Create a ProviderVerifier with custom public key finder if provided
+		commitType := providers.CommitTypesEnum.NONCE_CLAIM
 
-			opts := providers.GetDefaultGoogleOpOptions()
-			opts.Issuer = row.Issuer
-			opts.ClientID = row.ClientID
-			provider = providers.NewGoogleOpWithOptions(opts)
-		} else if strings.HasPrefix(row.Issuer, "https://login.microsoftonline.com") {
-			opts := providers.GetDefaultAzureOpOptions()
-			opts.Issuer = row.Issuer
-			opts.ClientID = row.ClientID
-			provider = providers.NewAzureOpWithOptions(opts)
-		} else if row.Issuer == "https://gitlab.com" {
-			opts := providers.GetDefaultGitlabOpOptions()
-			opts.Issuer = row.Issuer
-			opts.ClientID = row.ClientID
-			provider = providers.NewGitlabOpWithOptions(opts)
-		} else if row.Issuer == "https://token.actions.githubusercontent.com" {
-			provider = providers.NewGithubOp(row.Issuer, "")
-		} else {
-			opts := providers.GetDefaultGoogleOpOptions()
-			opts.Issuer = row.Issuer
-			opts.ClientID = row.ClientID
-			provider = providers.NewGoogleOpWithOptions(opts)
+		pvOpts := providers.ProviderVerifierOpts{
+			CommitType: commitType,
+			ClientID:   row.ClientID,
 		}
+
+		// If a custom public key finder is provided, use it
+		if opts.PublicKeyFinder != nil {
+			pvOpts.DiscoverPublicKey = opts.PublicKeyFinder
+		}
+
+		provider := providers.NewProviderVerifier(row.Issuer, pvOpts)
 
 		expirationPolicy, err = row.GetExpirationPolicy()
 		if err != nil {
