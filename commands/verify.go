@@ -22,9 +22,11 @@ import (
 	"io/fs"
 	"net/http"
 
+	"github.com/openpubkey/openpubkey/discover"
 	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/verifier"
 	"github.com/openpubkey/opkssh/commands/config"
+	"github.com/openpubkey/opkssh/jwkscache"
 	"github.com/openpubkey/opkssh/policy"
 	"github.com/openpubkey/opkssh/policy/files"
 	"github.com/openpubkey/opkssh/sshcert"
@@ -158,6 +160,19 @@ func (v *VerifyCmd) ReadFromServerConfig() error {
 	return serverConfig.SetEnvVars()
 }
 
+// SetServerConfig applies settings from an already-loaded server config
+func (v *VerifyCmd) SetServerConfig(serverConfig *config.ServerConfig) {
+	if serverConfig == nil {
+		return
+	}
+	v.denyList = policy.DenyList{
+		Emails: serverConfig.DenyEmails,
+		Users:  serverConfig.DenyUsers,
+	}
+	// Set environment variables (ignore errors as this is best-effort)
+	_ = serverConfig.SetEnvVars()
+}
+
 func (v *VerifyCmd) UserInfoLookup(ctx context.Context, pkt *pktoken.PKToken, accessToken string) (string, error) {
 	ui, err := verifier.NewUserInfoRequester(pkt, accessToken)
 	if err != nil {
@@ -174,4 +189,57 @@ func OpkPolicyEnforcerFunc(username string) PolicyEnforcerFunc {
 		PolicyLoader: policy.NewMultiPolicyLoader(username, policy.ReadWithSudoScript),
 	}
 	return policyEnforcer.CheckPolicy
+}
+
+// LoadServerConfig reads and parses the server config file
+func LoadServerConfig(configPath string) (*config.ServerConfig, error) {
+	osFs := afero.NewOsFs()
+	afs := &afero.Afero{Fs: osFs}
+
+	configBytes, err := afs.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	permsChecker := files.PermsChecker{
+		Fs:        osFs,
+		CmdRunner: files.ExecCmd,
+	}
+	err = permsChecker.CheckPerm(configPath, []fs.FileMode{0640}, "root", "opksshuser")
+	if err != nil {
+		return nil, err
+	}
+
+	serverConfig, err := config.NewServerConfig(configBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return serverConfig, nil
+}
+
+// NewCachedPublicKeyFinderFromConfig creates a CachedPublicKeyFinder from the server config
+func NewCachedPublicKeyFinderFromConfig(serverConfig *config.ServerConfig) *discover.PublicKeyFinder {
+	if serverConfig == nil {
+		return nil
+	}
+
+	cacheConfig := serverConfig.JWKSCache
+
+	// If caching is explicitly disabled, return nil (use default)
+	if !cacheConfig.IsEnabled() {
+		return nil
+	}
+
+	jwksCacheConfig := jwkscache.CacheConfig{
+		CacheDir:          cacheConfig.GetCacheDir(),
+		MaxCacheAge:       cacheConfig.GetMaxCacheAge(),
+		MaxCacheRetention: cacheConfig.GetMaxCacheRetention(),
+		RefreshJitter:     cacheConfig.GetRefreshJitter(),
+		EternalJWKSDir:    cacheConfig.GetEternalJWKSDir(),
+		Enabled:           cacheConfig.IsEnabled(),
+	}
+
+	cachedFinder := jwkscache.NewCachedPublicKeyFinder(jwksCacheConfig)
+	return cachedFinder.GetPublicKeyFinder()
 }

@@ -296,6 +296,22 @@ Arguments:
 			typArg := args[2]
 			extraArgs := args[3:]
 
+			// Load server config early to get JWKS cache settings
+			serverConfig, configErr := commands.LoadServerConfig(serverConfigPathArg)
+			if configErr != nil {
+				log.Println("Warning: failed to load server config:", configErr)
+				// Continue with default settings if config loading fails
+			}
+
+			// Create a cached public key finder if caching is configured
+			var verifierOpts policy.VerifierOptions
+			if serverConfig != nil {
+				if cachedFinder := commands.NewCachedPublicKeyFinderFromConfig(serverConfig); cachedFinder != nil {
+					verifierOpts.PublicKeyFinder = cachedFinder
+					log.Println("JWKS caching enabled")
+				}
+			}
+
 			providerPolicyPath := "/etc/opk/providers"
 			providerPolicy, err := policy.NewProviderFileLoader().LoadProviderPolicy(providerPolicyPath)
 			if err != nil {
@@ -306,15 +322,16 @@ Arguments:
 			printConfigProblems()
 			log.Println("Providers loaded: ", providerPolicy.ToString())
 
-			pktVerifier, err := providerPolicy.CreateVerifier()
+			pktVerifier, err := providerPolicy.CreateVerifierWithOptions(verifierOpts)
 			if err != nil {
 				log.Println("Failed to create pk token verifier (likely bad configuration):", err)
 				return err
 			}
 
 			v := commands.NewVerifyCmd(*pktVerifier, commands.OpkPolicyEnforcerFunc(userArg), serverConfigPathArg)
-			if err := v.ReadFromServerConfig(); err != nil {
-				log.Println("Failed to set environment variables in config:", err)
+			if serverConfig != nil {
+				// Apply remaining config settings (env vars, deny lists) since we already loaded the config
+				v.SetServerConfig(serverConfig)
 			}
 
 			if authKey, err := v.AuthorizedKeysCommand(ctx, userArg, typArg, certB64Arg, extraArgs); err != nil {
